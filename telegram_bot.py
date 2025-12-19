@@ -344,6 +344,12 @@ async def daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """Job untuk scanning harian"""
     logger.info("Running Daily Scan Job...")
     
+    # Check for Weekend (0=Mon, 6=Sun)
+    day_name = datetime.now(WIB).strftime("%A")
+    if datetime.now(WIB).weekday() >= 5: # 5=Sat, 6=Sun
+        logger.info(f"Skipping Daily Scan: Today is {day_name} (Market Closed).")
+        return
+    
     current_hour = datetime.now(WIB).hour
     session_id = 1 if current_hour < 12 else 2
     
@@ -419,6 +425,11 @@ async def daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
 async def bsjp_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """Job khusus untuk Sinyal BSJP (Beli Sore Jual Pagi) - 15:30 WIB"""
     logger.info("Running BSJP Scan Job...")
+    
+    # Check for Weekend
+    if datetime.now(WIB).weekday() >= 5:
+         logger.info("Skipping BSJP: Weekend.")
+         return
     
     tickers = load_tickers_from_file("idx_tickers.txt")
     if not tickers or len(tickers) < 500:
@@ -546,6 +557,10 @@ async def continuous_momentum_scan(context: ContextTypes.DEFAULT_TYPE):
     if now.hour == 0 and now.minute < 30:
         global SENT_SIGNALS_TODAY
         SENT_SIGNALS_TODAY.clear()
+        return
+    
+    # Check for Weekend
+    if now.weekday() >= 5:
         return
 
     # Only run during market hours (09:00 - 15:50)
