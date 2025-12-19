@@ -268,3 +268,6 @@ Bot akan online 24 jam (selama free quota belum habis).
 ±500 jam / bulan
 
 Cukup untuk bot Telegram non-heavy
+
+
+bisa tidak anda memberikan saya sinyal ketika ada emiten bergerak dari merah menuju hijau dengan cepat dan ada kemungkinan bakal naik tinggi hari itu juga, silahkan anda cari caranya bagaimana dan anda cari rumusnya yang paling terbaik, dan aplikasikan kedalam bot, untuk pengiriman anda bebas kapanpun selagi pasar masih buka dan server masih berjalan 

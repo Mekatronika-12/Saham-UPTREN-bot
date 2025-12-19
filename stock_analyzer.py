@@ -14,7 +14,7 @@ class StockAnalyzer:
     """Kelas untuk menganalisis saham dan mendeteksi uptrend"""
     
     def __init__(self):
-        self.min_data_days = 60  # Minimum data yang diperlukan (increased for ADX)
+        self.min_data_days = 30  # Adjusted to 30 to allow analysis of more stocks (e.g. recent IPOs or sparse data)
 
     def get_tick_size(self, price: float) -> int:
         """Mendapatkan fraksi harga (tick size) sesuai aturan BEI"""
@@ -270,54 +270,61 @@ class StockAnalyzer:
         # === CRITICAL FIX: Calculate vol_ratio HERE before using it ===
         vol_ratio = latest_volume / latest_volume_sma if latest_volume_sma > 0 else 1
         
-        # === 0. DETEKSI NAIK KENCANG (SPIKE) ===
-        # Request User: Kirim sinyal juga jika harga naik kencang (walau trend belum perfect)
+        # === 0. DETEKSI NAIK KENCANG / MOMENTUM (PRIORITAS UTAMA) ===
+        # Request User: Fokus saham yang "Naik Kenceng" untuk mengurangi waktu tunggu.
+        
         is_spike = False
-        if price_change_pct > 5 and vol_ratio > 1.5:
+        is_high_momentum = False
+        
+        # Criteria 1: Price Change > 2% AND Price > MA5 (Short term trend up)
+        # Criteria 2: Significant Value (>1B)
+        
+        transaction_value = latest_close * latest_volume
+        
+        if price_change_pct > 2 and latest_close > latest_sma20:
+             is_high_momentum = True
+             
+        if price_change_pct > 4 and vol_ratio > 1.2:
              is_spike = True
              reasons.append(f"🚀 HARGA NAIK KENCANG (+{price_change_pct:.1f}%)")
-             reasons.append(f"⚡ Volume Meledak ({vol_ratio:.1f}x Rata2)")
              
-             # Bypass MA Filters for Spike
-             # But still check basic sanity (not penny stock dying)
-             pass 
-        else:
-             # Normal Filter (Strict Uptrend)
-             # Base Filter: Harga tidak boleh di bawah SMA50 terlalu jauh (Downtrend akut skip dulu)
-             if latest_close < latest_sma50 * 0.95:
-                  return False, {"reason": "Trend Masih Bearish Parah (<SMA50)"}
-
-             # Kriteria Video: Prioritas MACD (Jika bukan Spike)
-             if not is_macd_reversal and not (latest_macd > latest_signal):
-                  return False, {"reason": "MACD Momentum Negatif / Tidak ada reversal"}
+        # === FILTERING BARU (STRICT FOR MOMENTUM) ===
         
-        if is_macd_reversal and not is_spike:
+        # 1. Filter: Value minimal 1 Miliar (Biar liquid)
+        if transaction_value < 1_000_000_000:
+             return False, {"reason": "Likuiditas Rendah (< 1M)"}
+             
+        # 2. Filter: Momentum Check
+        # User wants "Naik Kenceng". Reject if Price Change < 1% unless it's a perfect Golden Cross Setup
+        if price_change_pct < 1 and not (prev_histogram < 0 and latest_histogram > 0):
+             return False, {"reason": "Momentum Lemah (Kenaikan < 1%)"}
+
+        # 3. Base Trend Filter
+        # Still need basic trend filter but allow reversals
+        if latest_close < latest_sma50 * 0.90: # Allow deeper discount but not trash
+             return False, {"reason": "Trend Bearish Parah (<SMA50)"}
+
+        # 4. MACD / Indicator Check
+        # If it is high momentum (spike), we trust the volume and price more than lagging MACD.
+        # But if not spike, we need MACD confirmation.
+        
+        if not is_spike and not is_high_momentum:
+             # Normal strict mode for slower stocks
+             if not is_macd_reversal and not (latest_macd > latest_signal):
+                  return False, {"reason": "MACD Belum Confirm"}
+        
+        if is_macd_reversal:
              reasons.append(f"✓ {reversal_reason}")
-        elif not is_spike:
-             reasons.append("✓ MACD > Signal (Trend Positif)")
         
         # Support Filters
-        if latest_rsi > 80:
-             return False, {"reason": "RSI Overbought (>80)"}
-        
-        reasons.append(f"✓ RSI Aman ({latest_rsi:.1f})")
+        if latest_rsi > 85: # Sedikit longgar untuk saham gorengan/momentum
+             return False, {"reason": "RSI Overbought (>85)"}
 
-        # Volume Confirmation
-        # Tidak wajib breakout, tapi minimal ada transaksi
-        if latest_volume < latest_volume_sma * 0.5:
-             # Volume sepi banget, skip
-             pass # Or strict? Let's be lenient for reversal pattern
-        else:
-             reasons.append("✓ Volume Aktif")
-
-        # ADX Check (Optional for Reversal, strict for Trend Following)
-        # Untuk strategi "Mencari YANG AKAN uptrend", ADX mungkin masih rendah.
-        # Jadi kita tidak reject jika ADX rendah, tapi kita catat.
-        if latest_adx > 20:
-             reasons.append(f"✓ Trend Mulai Terbentuk (ADX={latest_adx:.1f})")
-
-        # === SCORING SYSTEM (Refined for MACD Focus) ===
+        # Scoring
         score = 60
+        if is_spike: score += 20
+        if is_high_momentum: score += 10
+        if transaction_value > 5_000_000_000: score += 10 # Prefer high liquid
         
         # 1. MACD Quality (Big Weight)
         if prev_histogram < 0 and latest_histogram > 0: # Golden Cross
@@ -354,13 +361,14 @@ class StockAnalyzer:
     
     def is_bsjp(self, data: pd.DataFrame) -> bool:
         """
-        Screening BSJP (Beli Sore Jual Pagi) based on specific criteria:
+        Screening BSJP (BELI SORE JUAL PAGI) updated criteria:
         1. 1 Day Price Returns (%) > 1
         2. Volume > 2 * Volume MA 20
         3. Volume > 2 * Previous Volume
-        4. Value > 10 Billion
-        5. Previous Price < Price (Green Candle)
+        4. Value > 10,000,000,000 (10 Miliar)
+        5. Price > Previous Price
         6. Price > Price MA 10
+        7. Previous Price >= 1
         """
         if len(data) < 25: return False
         
@@ -373,9 +381,9 @@ class StockAnalyzer:
         latest_volume = volume.iloc[-1]
         prev_volume = volume.iloc[-2]
         
-        # 1. Price Change > 1%
-        price_change_pct = (latest_close - prev_close) / prev_close * 100
-        if price_change_pct <= 1: return False
+        # 1. 1 Day Price Returns (%) > 1
+        price_return_pct = (latest_close - prev_close) / prev_close * 100
+        if price_return_pct <= 1: return False
         
         # 2. Volume > 2 * Volume MA 20
         vol_ma20 = volume.rolling(window=20).mean().iloc[-1]
@@ -384,27 +392,104 @@ class StockAnalyzer:
         # 3. Volume > 2 * Previous Volume
         if latest_volume <= 2 * prev_volume: return False
         
-        # 4. Value > 10 Billion
-        # Value approx = Close * Volume
+        # 4. Value > 10,000,000,000
         transaction_value = latest_close * latest_volume
         if transaction_value <= 10_000_000_000: return False
         
-        # 5. Previous Price < Price (Green Candle)
-        # Already covered by Price Change > 1%, but explicit check:
-        if prev_close >= latest_close: return False
+        # 5. Price > Previous Price (Already covered by #1, but following rules)
+        if latest_close <= prev_close: return False
         
         # 6. Price > Price MA 10
-        ma10 = close.rolling(window=10).mean().iloc[-1]
-        if latest_close <= ma10: return False
+        price_ma10 = close.rolling(window=10).mean().iloc[-1]
+        if latest_close <= price_ma10: return False
+        
+        # 7. Previous Price >= 1
+        if prev_close < 1: return False
         
         return True
     
+    def is_red_to_green_momentum(self, data: pd.DataFrame) -> Tuple[bool, Dict]:
+        """
+        Strategi: RED TO GREEN + SPIKE
+        Mencari saham yang sempat merah (Low < PrevClose) tapi sekarang Hijau Kuat.
+        Ciri-ciri saham yang akan reversal/naik tinggi hari ini.
+        """
+        if len(data) < 25: return False, {}
+        
+        close = data['Close']
+        high = data['High']
+        low = data['Low']
+        open_price = data['Open']
+        volume = data['Volume']
+        
+        # Latest Candle
+        latest_close = close.iloc[-1]
+        latest_open = open_price.iloc[-1]
+        latest_low = low.iloc[-1]
+        latest_high = high.iloc[-1]
+        latest_volume = volume.iloc[-1]
+        
+        # Previous Day
+        prev_close = close.iloc[-2]
+        
+        # 1. Condition: Was Red (Low < PrevClose)
+        # Artinya sempat turun di bawah harga kemarin
+        if latest_low >= prev_close:
+             return False, {} # Tidak pernah merah, ini Open Gap Up atau selalu hijau
+             
+        # 2. Condition: Now Green (Close > PrevClose)
+        if latest_close <= prev_close:
+             return False, {} # Masih merah
+             
+        # 3. Condition: Strong Green Candle (Close > Open)
+        if latest_close <= latest_open:
+             return False, {}
+             
+        # 4. Momentum: Change > 1% but < 20% (Avoid ARA limit logic issues or too late)
+        change_pct = (latest_close - prev_close) / prev_close * 100
+        if change_pct < 1.0 or change_pct > 24:
+             return False, {}
+             
+        # 5. Volume Spike (Relative to MA20)
+        # Kita asumsikan ini intraday, jadi volume mungkin belum full daily.
+        # Tapi "Momentum" biasanya volume deres.
+        vol_ma20 = volume.rolling(window=20).mean().iloc[-2] # Pakai rata2 historical
+        
+        # Minimal volume sudah tembus 25% dari rata-rata harian (untuk pagi)
+        # atau Ratio > 1.5x volume kemarin di jam yang sama (susah dpt data jam)
+        # Kita pakai threshold simple: Volume > 0.3 * MA20Volume
+        if latest_volume < (vol_ma20 * 0.3):
+             return False, {}
+             
+        # 6. Value Filter (> 2 Miliar agar tidak gorengan parah)
+        transaction_value = latest_close * latest_volume
+        if transaction_value < 2_000_000_000:
+             return False, {}
+
+        # 7. Additional Boost: Breakout Resistance Intraday?
+        # Sederhana: Close dekat High (Strong finish potential)
+        # Body candle > Upper Shadow
+        upper_shadow = latest_high - latest_close
+        body = latest_close - latest_open
+        if upper_shadow > body * 1.5: # Shadow terlalu panjang, reject (Selling pressure)
+             return False, {}
+             
+        return True, {
+            "strategy": "RED TO GREEN MOMENTUM",
+            "price": latest_close,
+            "change_pct": change_pct,
+            "volume": latest_volume,
+            "prev_close": prev_close,
+            "low": latest_low,
+            "reason": f"Sempat turun ke {int(latest_low)}, Rebound kuat ke {int(latest_close)} (+{change_pct:.1f}%)"
+        }
+
     def calculate_entry_tp(self, data: pd.DataFrame, analysis: Dict, session: int = None, iep: float = None) -> Tuple[Optional[float], Optional[float], Dict]:
         """
         Menghitung Entry Point & TP dengan Analisis Mendalam (Deep Research):
         1. Fibonacci Retracement (Golden Price)
         2. Trend Structure
-        3. IEP Integration
+        3. Momentum Adaptive Entry
         """
         if len(data) < 60:
             return None, None, {"error": "Data kurang untuk analisis mendalam"}
@@ -422,12 +507,10 @@ class StockAnalyzer:
         # 2. Moving Averages Support
         ma5 = self.calculate_sma(close, 5).iloc[-1]
         ma10 = self.calculate_sma(close, 10).iloc[-1]
-        ma20 = self.calculate_sma(close, 20).iloc[-1]
         
         # 3. Indicators
         indicators = analysis.get("indicators", {})
         latest_adx = indicators.get("adx", 20)
-        atr = self.calculate_atr(high, low, close, 14).iloc[-1]
         support, resistance = self.calculate_support_resistance(data, 20)
         
         # 4. Candlestick Analysis (Latest finalized candle)
@@ -436,155 +519,155 @@ class StockAnalyzer:
             data['Low'].iloc[-1], latest_close, close.iloc[-2]
         )
         
-        # === STRATEGY: BEST ENTRY CALCULATION ===
+        # === STRATEGY: SMART ENTRY SYSTEM ===
         
-        # Base Entry: Fibonacci Golden Pocket (0.5 - 0.618)
-        # Jika harga saat ini jauh di atas Fib 0.5, berarti trend sangat kuat.
-        # Support terdekat menjadi MA5 atau Fib 0.382.
-        
-        entry_haka = int(latest_close)
-        
-        # Tentukan Level Pullback Ideal
-        # Priority: Fib 0.382 (Strong Trend) > Fib 0.5 (Normal) > Fib 0.618 (Deep Correction)
-        
-        if latest_close > fib['fib_0236']:
-             # Harga di pucuk swing
-             entry_pullback = fib['fib_0382'] # Tunggu di first support
-             entry_source = "Fibonacci 0.382"
-        elif latest_close > fib['fib_05']:
-             entry_pullback = fib['fib_05']
-             entry_source = "Fibonacci 0.5 (Mid)"
+        # Determine Market Momentum State
+        # Lowered threshold to 25 for strong uptrend (Indonesian market often volatile with lower ADX start)
+        if latest_adx > 25 and latest_close > ma5:
+            market_state = "STRONG_UPTREND"
+        elif latest_adx > 15:
+            market_state = "NORMAL_UPTREND"
         else:
-             entry_pullback = fib['fib_0618']
-             entry_source = "Fibonacci Golden Ratio (0.618)"
-             
-        # Combine with MAs for precision
-        # Ambil max(MA10, FibLevel) karena MA sering jadi dynamic support yang lebih dihormati saat strong uptrend
-        entry_pullback = max(entry_pullback, ma10) 
-        if latest_adx > 30:
-             # Super strong, don't wait too deep
-             entry_pullback = max(entry_pullback, ma5)
-             entry_source += " + MA5 Confluence"
+            market_state = "SIDEWAYS/WEAK"
+            
+        # Entry Logic Options
+        
+        # 1. Aggressive Entry (For High Conviction/HAKA)
+        # Entry near current price
+        entry_aggressive = int(latest_close)
+        
+        # 2. Moderate/Best Entry (Dynamic Support)
+        if market_state == "STRONG_UPTREND":
+            # If fast moving, MA5 is the floor.
+            entry_best = int(ma5)
+            
+            # If deviation is large (Price >> MA5), 'Best' might be too far.
+            # Create a 'Hybrid' entry closer to price.
+            if latest_close > ma5 * 1.05:
+                 entry_best = int((latest_close + ma5) / 2)
+        
+        elif market_state == "NORMAL_UPTREND":
+            entry_best = int(ma10)
+            # If price is maintaining above MA5 distinctively
+            if latest_close > ma5:
+                entry_best = int(ma5)
         else:
-             entry_source += " + MA10 Confluence"
-             
-        entry_final = int(entry_pullback)
-        recommended_option = "PULLBACK"
-        recom_reason = f"Entry aman di area {entry_source}. Market volatile."
+            entry_best = int((ma10 + support)/2) # Wait deeper
+        
+        # 3. Conservative/Safe Entry (Deep Pullback)
+        entry_safe = int(max(support, fib['fib_0618']))
 
-        # === Derived Metrics for Logic ===
-        vol_ratio = 1.0
-        if len(volume) > 20: 
-             vol_avg = volume.rolling(20).mean().iloc[-1]
-             if vol_avg > 0: vol_ratio = volume.iloc[-1] / vol_avg
-             
-        tp_conservative = fib['fib_ext_1272']
-        tp_aggressive = fib['fib_ext_1618']
+        # === SELECTION LOGIC ===
+        
+        # Logic: If user asks "Why not current price?", we validte it here.
+        # If trend is strong, Recommended Option becomes HAKA/Aggressive
+        
+        if market_state == "STRONG_UPTREND":
+             entry_final = entry_aggressive
+             recommended_option = "HAKA (Momentum)"
+             recom_reason = "Momentum sangat kuat. Disarankan masuk dekat harga running (HAKA) agar tidak ketinggalan."
+             if entry_best < entry_aggressive * 0.98:
+                  # If there's a significant gap between Aggressive and MA5, offer range
+                  recom_reason += f" Atau antri di {entry_best} jika ingin lebih aman."
+        elif market_state == "NORMAL_UPTREND":
+             entry_final = entry_best
+             recommended_option = "BUY ON WEAKNESS"
+             recom_reason = f"Trend solid. Entry terbaik di area MA5-MA10."
+        else:
+             entry_final = entry_safe
+             recommended_option = "WAIT AND SEE"
+             recom_reason = "Trend belum confirm kuat. Tunggu di support bawah."
 
-        # === SESSION 1 & IEP DEEP ANALYSIS ===
+        # SESSION 1 / LIVE MARKET LOGIC
         iep_val = 0
         if session == 1 and iep is not None and iep > 0:
-            last_date = data.index[-1].date()
-            if last_date == datetime.now().date():
-                 prev_close = close.iloc[-2]
-            else:
-                 prev_close = close.iloc[-1]
-            
             iep_val = iep
-            
-            # Smart IEP Logic with Fibonacci Validation
-            if iep > prev_close:
-                # GAP UP Open
-                # Validasi: Apakah Gap Up ini menembus Resistance atau Fib Level?
-                if iep > fib['swing_high']:
-                     # Breakout New High -> Very Bullish
-                     entry_final = self.add_ticks(iep, 2)
-                     recommended_option = "HAKA (BREAKOUT)"
-                     recom_reason = f"IEP Breakout Swing High ({int(fib['swing_high'])}). Potensi rally kencang."
-                else:
-                     # Gap Up tapi masih di dalam range
-                     entry_final = iep
-                     recommended_option = "BUY ON STRENGTH"
-                     recom_reason = f"Open Gap Up. Akumulasi di harga pembukaan ({int(iep)})."
+            # Gap Check
+            if iep > latest_close * 1.02: # Gap Up > 2%
+                 entry_final = iep
+                 recommended_option = "BUY ON BREAKOUT (GAP)"
+                 recom_reason = f"Open Gap Up signifik. Ikuti arus momentum pagi."
+            elif iep < latest_close * 0.98: # Gap Down > 2%
+                 entry_final = entry_safe
+                 recommended_option = "WAIT FOR DIP"
+                 recom_reason = f"Open Gap Down. Tunggu pantulan di area support kuat."
             else:
-                # GAP DOWN / Correction Open
-                # Cek apakah koreksi ini mendarat di Golden Pocket?
-                
-                # Check distance to nearest strong support (Fib 0.5 or MA10)
-                dist_to_fib05 = abs(iep - fib['fib_05'])
-                dist_to_ma10 = abs(iep - ma10)
-                
-                if iep > fib['fib_0382'] and latest_adx > 25:
-                    # Koreksi dangkal di trend kuat = BUY
-                    entry_final = iep
-                    recommended_option = "PRO BUY (DIP)"
-                    recom_reason = f"IEP ({int(iep)}) koreksi sehat (di atas Fib 0.382). Buy sebelum rebound."
-                else:
-                    # Koreksi agak dalam, better wait
-                    entry_final = max(int(ma10), int(iep))
-                    recommended_option = "WAIT / SLOW BUY"
-                    recom_reason = f"Koreksi pagi. Tunggu stabil di area {int(entry_final)}."
-
-
-
-        # === SOROS PHILOSOPHY: "It's not whether you're right or wrong, but how much money you make..." ===
-        # 1. IDENTIFY HIGH CONVICTION PLAY
-        soros_signal = False
-        if latest_adx > 35 and vol_ratio > 1.5 and candle_pattern != "DOJI (Wait)":
-             soros_signal = True
-             recommended_option = "SUPER CONVICTION (HAKA)"
-             recom_reason = f"🔥🔥 SOROS STYLE: High Conviction! Trend & Volume Ledakan. Sikat Kanan."
-             entry_final = entry_haka # Agresif
+                 # Normal open
+                 if market_state == "STRONG_UPTREND":
+                     entry_final = iep
+                     recommended_option = "HAKA (Open)"
         
-        # 2. LET PROFITS RUN (Trailing Logic)
-        # Instead of fixed TP, we aim for extended run if trend is strong
-        if soros_signal or latest_adx > 40:
-             # Target is NOT just resistance, but breakout extension
-             tp_price = max(fib['fib_ext_1618'], resistance * 1.10)
-             strategy = "LET PROFITS RUN (Trailing Stop)"
+        # Force Adjust: If Entry Final is too far from current (e.g. > 5%) in an uptrend, pull it up.
+        if market_state in ["STRONG_UPTREND", "NORMAL_UPTREND"] and entry_final < latest_close * 0.95:
+             entry_final = int(latest_close * 0.98) # 2% discount max
+             recommended_option += " (Adjusted)"
+             recom_reason = "Harga running kencang. Entry disesuaikan mendekati harga pasar."
+
+        # === TP CALCULATION ===
+        tp_conservative = fib['fib_ext_1272']
+        tp_aggressive = fib['fib_ext_1618']
+        
+        # TP 1
+        tp1 = max(resistance, latest_close * 1.03) # Min 3% yield
+        
+        # TP 2 (Target Utama)
+        if market_state == "STRONG_UPTREND":
+            tp2 = tp_aggressive
+            strategy = "TREND FOLLOWING"
         else:
-             # Normal Logic
-             if latest_adx > 35:
-                # Trend is a beast -> Aim for 1.618
-                tp_price = tp_aggressive
-                strategy = "TREND FOLLOWING"
-             else:
-                # Normal trend -> Aim for 1.272
-                tp_price = tp_conservative
-                strategy = "SWING OPTIMAL"
-        
-        # Safety Check: TP must be > Breakout/Resistance
-        target_breakout = max(resistance, entry_final * 1.05)
-        tp_price = max(tp_price, target_breakout)
-        
-        # Ensure min profit 4%
-        if tp_price < entry_final * 1.04:
-            tp_price = entry_final * 1.04
+            tp2 = tp_conservative
+            strategy = "SWING TRADING"
             
-        profit_pct = ((tp_price - entry_final) / entry_final) * 100
+        tp3 = tp2 * 1.10 # Extended run
+        
+        # Ensure Hierarchy
+        if tp2 <= tp1: tp2 = tp1 * 1.05
+        if tp3 <= tp2: tp3 = tp2 * 1.05
+
+        # === TIMEFRAME INFERENCE ===
+        # Determine the holding period based on strategy and option
+        if recommended_option.startswith("HAKA") or recommended_option.startswith("BUY ON BREAKOUT"):
+             timeframe = "DAYTRADE (1-3 Hari) / SCALPING"
+        elif strategy == "SWING TRADING" or recommended_option == "BUY ON WEAKNESS":
+             timeframe = "SWING (1-3 Minggu)"
+        elif strategy == "TREND FOLLOWING":
+             timeframe = "TREND FOLLOWING (Bisa > 1 Bulan)"
+        else:
+             timeframe = "WATCHLIST / SHORT TERM"
+             
+        # Override for Session 1 gap ups -> likely Daytrade focus
+        if session == 1 and iep > latest_close * 1.02:
+             timeframe = "DAYTRADE (Manfaatkan Volatilitas Pagi)"
+
+        # Calculate profit pct for the dictionary
+        profit_pct = ((tp2 - entry_final) / entry_final) * 100
         is_ara_potential = ((resistance - entry_final) / entry_final * 100 < 5) and profit_pct > 3
 
         result = {
             "entry": entry_final,
-            "iep": iep_val if iep_val and iep_val > 0 else 0,
-            "entry_haka": entry_haka,
-            "entry_pullback": int(entry_pullback),
-            "fib_support": int(fib['fib_0618']), # Info tambahan
-            "fib_resistance": int(fib['fib_ext_1618']), # Info tambahan
+            "entry_aggressive": int(entry_aggressive),
+            "entry_safe": int(entry_safe),
+            "entry_haka": int(entry_aggressive), # Alias for aggressive
+            "entry_pullback": int(entry_safe),   # Alias for safe
+            "entry_pullback_reason": recom_reason, # Alias
+            "iep": iep_val if iep_val else 0,
             "recommended_option": recommended_option,
             "recom_reason": recom_reason,
-            "entry_pullback_reason": entry_source,
-            "tp": int(tp_price),
+            "tp": int(tp2), # Main TP for simple dict access
+            "tp1": int(tp1),
+            "tp2": int(tp2),
+            "tp3": int(tp3),
             "profit_pct": profit_pct,
+            "is_ara_potential": is_ara_potential,
             "support": int(support),
             "resistance": int(resistance),
             "candle_pattern": candle_pattern,
-            "is_ara_potential": is_ara_potential,
             "strategy": strategy,
-            "market_cond": f"{candle_pattern} / ADX {latest_adx:.1f} / SOROS MODE: {'ON' if soros_signal else 'OFF'}"
+            "timeframe": timeframe,
+            "market_cond": f"{market_state} (ADX {latest_adx:.0f})"
         }
         
-        return entry_final, tp_price, result
+        return entry_final, int(tp2), result
     
     def analyze_stock(self, ticker: str, period: str = "6mo", session: int = None) -> Dict: # Using 6mo for better SMA200/ADX context
         """
@@ -597,9 +680,10 @@ class StockAnalyzer:
             data = stock.history(period=period)
             
             if data.empty or len(data) < self.min_data_days:
+                # Log but don't delete from file, just return failure for this run
                 return {
                     "success": False,
-                    "error": f"Data tidak mencukupi untuk {ticker}",
+                    "error": f"Data tidak mencukupi/kosong untuk {ticker}",
                     "ticker": ticker
                 }
             
@@ -697,6 +781,124 @@ class StockAnalyzer:
                 "ticker": ticker
             }
     
+    def get_stock_news(self, stock: yf.Ticker) -> str:
+        """Mengambil dan menganalisis sentimen berita terbaru via Google News RSS"""
+        import requests
+        import xml.etree.ElementTree as ET
+        import html
+        import re
+        
+        try:
+            # 1. Try Google News RSS first (More up to date for IDX)
+            ticker_clean = stock.ticker.replace(".JK", "")
+            # Use quotes to ensure specific ticker search (e.g. "BUMI")
+            query = f'"{ticker_clean}" saham'
+            url = f"https://news.google.com/rss/search?q={query}&hl=id-ID&gl=ID&ceid=ID:id"
+            
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+            response = requests.get(url, headers=headers, timeout=5)
+            news_items = []
+            
+            # Helper to clean and add item
+            def add_item(t, l):
+                t = html.unescape(t)
+                for sept in [' - ', ' | ']: # Remove source suffix
+                    if sept in t:
+                        t = t.rsplit(sept, 1)[0]
+                # Filter: Ticker must be present (lenient) or generic huge news
+                # But user wants specific.
+                if ticker_clean.lower() in t.lower():
+                     news_items.append({"title": t, "link": l})
+
+            if response.status_code == 200:
+                root = ET.fromstring(response.content)
+                items = root.findall('./channel/item')
+                
+                for item in items[:5]: # Check top 5 parent items
+                    title_elem = item.find('title')
+                    link_elem = item.find('link')
+                    desc_elem = item.find('description') # Description often has the cluster
+                    
+                    if title_elem is None or link_elem is None: continue
+
+                    title_raw = title_elem.text
+                    link_raw = link_elem.text
+                    desc_raw = desc_elem.text if desc_elem is not None else ""
+                    
+                    # Check if description has clustered stories (HTML list)
+                    if desc_raw and '<ol>' in desc_raw:
+                        # Extract links from HTML
+                        matches = re.findall(r'<a href="(.*?)".*?>(.*?)</a>', desc_raw)
+                        for link, title in matches:
+                            add_item(title, link)
+                    else:
+                        add_item(title_raw, link_raw)
+                        
+            # 2. Deduplicate by title
+            unique_news = []
+            seen_titles = set()
+            for n in news_items:
+                if n['title'] not in seen_titles:
+                    unique_news.append(n)
+                    seen_titles.add(n['title'])
+            
+            news_items = unique_news[:5] # Limit pool
+
+            # 3. Fallback to Yahoo if empty
+            if not news_items:
+                 try:
+                     y_news = stock.news
+                     for item in y_news[:3]:
+                        content = item.get('content', {})
+                        t = content.get('title', item.get('title', ''))
+                        l = content.get('clickThroughUrl', item.get('link', ''))
+                        if t and l:
+                            add_item(t, l)
+                 except: 
+                     pass
+                 
+                 # Deduplicate again after fallback
+                 unique_news = []
+                 seen_titles = set()
+                 for n in news_items:
+                    if n['title'] not in seen_titles:
+                        unique_news.append(n)
+                        seen_titles.add(n['title'])
+
+            news_items = unique_news[:3] # Final Check limit 3
+
+            if not news_items:
+                return "Tidak ada berita terbaru saat ini."
+            
+            # Keywords for sentiment
+            pos_keywords = ["profit", "jump", "surge", "gain", "buy", "bull", "growth", "record", "revenue up", "income up", "acquisition", "laba", "naik", "tumbuh", "dividen", "akuisisi", "kerjasama", "positif", "hijau", "cuan", "melejit", "terbang", "disetujui", "divestasi", "untung", "kinclong", "bersinar", "net buy", "full senyum", "dividen"]
+            neg_keywords = ["loss", "drop", "plunge", "fall", "sell", "bear", "down", "revenue down", "income down", "suit", "fine", "debt", "bankrupt", "rugi", "turun", "anjlok", "utang", "pailit", "gugat", "merah", "koreksi", "suspend", "net sell", "boncos", "melorot", "anjlok", "kebakaran", "phk"]
+            
+            formatted_news = []
+            
+            for item in news_items:
+                title = item['title']
+                link = item['link']
+                
+                # Sentiment
+                text_to_check = title.lower()
+                if any(k in text_to_check for k in pos_keywords):
+                    emoji = "🟢"
+                elif any(k in text_to_check for k in neg_keywords):
+                    emoji = "🔴"
+                else:
+                    emoji = "⚪"
+                
+                # Format: "• [Emoji] Title" -> Link (Clean & clickable)
+                news_entry = f"• {emoji} [{title}]({link})"
+                formatted_news.append(news_entry)
+                
+            return "\n".join(formatted_news)
+            
+        except Exception as e:
+            print(f"News fetch error: {e}")
+            return "Gagal mengambil berita."
+
     def get_stock_fundamentals(self, stock: yf.Ticker) -> Dict:
         """Mengambil data fundamental perusahaan"""
         try:
@@ -798,26 +1000,134 @@ class StockAnalyzer:
         
         # 2. Add Fundamentals (Refresh in case base analysis skipped it)
         finals = self.get_stock_fundamentals(stock)
+        base_result["fundamentals"] = finals
+        
+        # 2b. Add News
+        news_summary = self.get_stock_news(stock)
+        base_result["news"] = news_summary
         
         # 3. Check technicals again if base_result was 'false' on uptrend
+        # or if we are just doing a detailed lookup.
+        # Retry mechanism for data fetching
+        data = pd.DataFrame()
+        for attempt in range(3):
+            try:
+                data = stock.history(period="6mo")
+                if not data.empty and len(data) > 30: # 30 days min for basic MA
+                    break
+            except Exception as e:
+                print(f"Retry {attempt+1} for {ticker}: {e}")
+            
+        # 2c. Force Realtime Price Update
+        
+        # Helper for safe float -> int
+        def safe_int(val):
+            try:
+                if val is None or pd.isna(val): return 0
+                return int(val)
+            except:
+                return 0
+
+        # Helper for safe pct
+        def calc_pct(curr, prev):
+            if not prev or prev == 0: return 0.0
+            return ((curr - prev) / prev) * 100
+
+        current_price = 0
+        change_pct = 0
+
+        try:
+            # Get realtime price from fast_info (most accurate for IDX)
+            current_price = None
+            prev_close = None
+            
+            # Try fast_info first (most reliable/fast)
+            if hasattr(stock, 'fast_info'):
+                try:
+                    current_price = stock.fast_info.last_price
+                    prev_close = stock.fast_info.previous_close
+                    if current_price is None: 
+                        current_price = stock.fast_info.get('last_price')
+                        prev_close = stock.fast_info.get('previous_close')
+                except:
+                    pass
+            
+            # Fallback to stock.info
+            if current_price is None:
+                 info = stock.info
+                 current_price = info.get('currentPrice') or info.get('regularMarketPrice')
+                 prev_close = info.get('previousClose') or info.get('regularMarketPreviousClose')
+
+            if current_price and prev_close:
+                change_pct = calc_pct(current_price, prev_close)
+            
+                # Update base_result
+                base_result["current_price"] = current_price
+                base_result["change_pct"] = change_pct
+                
+                # Update DataFrame for technical analysis
+                if not data.empty:
+                    last_dt = data.index[-1]
+                    # Check if the last candle is from Today
+                    is_today = last_dt.date() == datetime.now().date()
+                    
+                    if is_today:
+                        # Update existing candle
+                        data.at[last_dt, 'Close'] = current_price
+                        # Update High/Low if price broke them
+                        if current_price > data.at[last_dt, 'High']:
+                            data.at[last_dt, 'High'] = current_price
+                        if current_price < data.at[last_dt, 'Low']:
+                            data.at[last_dt, 'Low'] = current_price
+                    else:
+                        # Append new virtual candle for Today (Snapshot)
+                        # import pandas as pd # Removed to avoid UnboundLocalError
+                        new_idx = pd.Timestamp(datetime.now(), tz=last_dt.tz)
+                        
+                        new_row_dict = {
+                            'Open': current_price,
+                            'High': current_price,
+                            'Low': current_price,
+                            'Close': current_price,
+                            'Volume': 0
+                        }
+                        new_row = pd.DataFrame([new_row_dict], index=[new_idx])
+                        
+                        # Explicitly cast to match types to avoid FutureWarnings or Errors
+                        try:
+                           data = pd.concat([data, new_row])
+                        except:
+                           pass # If concat fails, ignore realtime update to dataframe
+                        
+        except Exception as e:
+            print(f"Realtime price fetch error: {e}")
+            current_price = data['Close'].iloc[-1] if not data.empty else 0
+            change_pct = 0
+            
+        # Fallback if current_price is missing
+        if not current_price and not data.empty:
+            current_price = data['Close'].iloc[-1]
+            
+        if data.empty or len(data) < 30:
+             return {"success": False, "error": f"Data tidak cukup/kosong untuk {ticker} (Coba lagi nanti)"}
+
         if not base_result.get("is_uptrend"):
-             data = stock.history(period="6mo")
-             if not data.empty and len(data) > 60:
+             if not data.empty and len(data) > 50:
                  is_up, analysis = self.is_uptrend(data)
+                 # Force calculation for detailed view even if technically not 'Strong Uptrend'
                  entry, tp, tp_analysis = self.calculate_entry_tp(data, analysis)
                  base_result.update(tp_analysis)
                  base_result["analysis"] = analysis
-                 base_result["current_price"] = data['Close'].iloc[-1]
-                 base_result["name"] = ticker 
                  base_result["success"] = True
+                 base_result["is_uptrend"] = is_up # Update status
              else:
-                 return {"success": False, "error": "Data tidak cukup"}
+                 return {"success": False, "error": "Data history terlalu pendek (<50 hari)"}
 
         analysis = base_result.get("analysis", {})
         indicators = analysis.get("indicators", {})
         
         # 4. Add Bollinger Bands Analysis
-        data = stock.history(period="6mo")
+        # Re-calculate with updated data
         close = data['Close']
         sma20 = close.rolling(window=20).mean()
         std20 = close.rolling(window=20).std()
@@ -827,7 +1137,7 @@ class StockAnalyzer:
         latest_close = close.iloc[-1]
         latest_upper = upper_bb.iloc[-1]
         latest_lower = lower_bb.iloc[-1]
-        bb_width = (latest_upper - latest_lower) / sma20.iloc[-1]
+        bb_width = (latest_upper - latest_lower) / sma20.iloc[-1] if not sma20.empty and sma20.iloc[-1] != 0 else 0
         
         bb_status = "NORMAL"
         if bb_width < 0.10: # Narrow band
@@ -841,47 +1151,79 @@ class StockAnalyzer:
         
         narrative = self.get_market_narrative(ticker, latest_close, support, resistance, analysis, bb_status)
         
+        # Override Narrative if manual Price Change is high but ADX low (False Sideways)
+        if indicators.get('adx', 0) < 20 and abs(change_pct) > 3 and "Sideways" in narrative:
+            narrative = narrative.replace("Sideways", "Volatile / Breakout").replace("Bergerak stabil", "Bergerak agresif")
+
         # 4. Construct Final Response Structure
         entry = base_result.get("entry", latest_close)
         
-        # Custom TP Levels
-        tp1 = entry * 1.02 # Scalping
-        tp2 = base_result.get("tp", entry * 1.05)
-        tp3 = base_result.get("resistance", entry * 1.10)
+        # Custom TP Levels (Sorted & Validated)
+        potential_tps = {
+            entry * 1.02,
+            base_result.get("resistance", 0),
+            base_result.get("tp", 0),
+            base_result.get("fib_resistance", 0)
+        }
         
-        # Calculate Cutloss
-        # Typically under previous swing low or support
+        # Filter: Unique, > Entry + 1% to be meaningful
+        valid_tps = sorted([t for t in potential_tps if t > entry * 1.01])
+        
+        # Ensure we have at least 3 levels
+        if not valid_tps:
+             valid_tps = [entry * 1.02]
+             
+        while len(valid_tps) < 3:
+             valid_tps.append(valid_tps[-1] * 1.05)
+             
+        tp1 = valid_tps[0]
+        tp2 = valid_tps[1]
+        tp3 = valid_tps[2]
+        
         cutloss = base_result.get("entry_pullback", entry * 0.95) * 0.97
         
-        # Estimate Hit Days based on TP2 (Main Target)
+        # Estimate Hit Days
         tp_pct_calc = ((tp2 - entry) / entry) * 100
-        if tp_pct_calc <= 3:
-            est_days = "1-2 Hari"
-        elif tp_pct_calc <= 8:
-            est_days = "3-5 Hari"
-        elif tp_pct_calc <= 15:
-            est_days = "1-2 Minggu"
-        else:
-            est_days = "2-4 Minggu"
+        if tp_pct_calc <= 3: est_days = "1-2 Hari"
+        elif tp_pct_calc <= 8: est_days = "3-5 Hari"
+        elif tp_pct_calc <= 15: est_days = "1-2 Minggu"
+        else: est_days = "2-4 Minggu"
         
         base_result["est_hit_days"] = est_days
         
-        # Format response message (Text)
+        change_pct_clean = change_pct if isinstance(change_pct, (int, float)) else 0
+        
+        price_icon = "🟢" if change_pct_clean >= 0 else "🔴"
+        
+        # Safe Int wrappers
+        c_price = safe_int(current_price)
+        s_eps = finals.get('eps', '-')
+        s_ni = finals.get('net_income', '-')
+        s_ast = finals.get('total_assets', '-')
+        
         message = (
             f"⚡ *ANALISA SAHAM - {stock.info.get('longName', ticker)} ({ticker})*\n"
             f"🕒 Waktu: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"{price_icon} *Harga Saat Ini: {c_price:,}* ({change_pct_clean:+.2f}%)\n\n"
             f"{narrative}\n\n"
             f"Kondisi Fundamental:\n"
-            f"• EPS (Earnings Per Share): {finals['eps']}\n"
-            f"• Net Income (TTM): {finals['net_income']}\n"
-            f"• Total Aset: {finals['total_assets']}\n\n"
-            f"🚪 Entry: {int(entry)}\n"
-            f"🛡 Support: {int(support)}\n"
-            f"🚀 Resistance: {int(resistance)}\n\n"
-            f"💵 TP 1: {int(tp1)}\n"
-            f"💰 TP 2: {int(tp2)}\n"
-            f"💸 TP 3: {int(tp3)}\n\n"
-            f"Cutloss: {int(cutloss)}\n\n"
+            f"• EPS (Earnings Per Share): {s_eps}\n"
+            f"• Net Income (TTM): {s_ni}\n"
+            f"• Total Aset: {s_ast}\n\n"
+            f"📰 *Berita Terkait:*\n"
+            f"{base_result.get('news', '-')}\n\n"
+            
+            f"🎯 *Rekomendasi Entry:*\n"
+            f"🔹 Best Buy: {safe_int(entry)}\n"
+            f"🔸 Aggressive: {safe_int(base_result.get('entry_aggressive', entry))}\n"
+            f"🛡 Conservative: {safe_int(base_result.get('entry_safe', entry))}\n\n"
+            
+            f"🛡 Support: {safe_int(support)}\n"
+            f"🚀 Resistance: {safe_int(resistance)}\n\n"
+            f"💵 TP 1: {safe_int(tp1)}\n"
+            f"💰 TP 2: {safe_int(tp2)}\n"
+            f"💸 TP 3: {safe_int(tp3)}\n\n"
+            f"Cutloss: {safe_int(cutloss)}\n\n"
             f"🔴 ‼️ Peringatan: Waspada volatilitas pasar. Gunakan money management yang bijak."
         )
         
